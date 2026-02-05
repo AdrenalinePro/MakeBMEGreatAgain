@@ -1,78 +1,130 @@
-# WGD-MRI 深度学习项目
+- # WGD-MRI (Wavelet-Guided Diffusion) — English README
 
-## 1. 安装依赖
+  This project implements a wavelet-based conditional diffusion model for neonatal brain MRI enhancement. The primary goal is to enhance low-field (0.35T) MRI into a cleaner, 1.5T-like appearance while preserving anatomical structure.
 
-```bash
-pip install -r requirements.txt
-```
+  ## Overview
 
-## 2. 数据准备
+  **Task**: Unpaired conditional enhancement (0.35T → 1.5T style).
 
-将 0.35T 与 1.5T 图像分别放到如下目录，支持 NIfTI (.nii/.nii.gz)，会按轴向切片作为样本：
+  **Key idea**:
 
-- data/0_35T
-- data/1_5T
+  - Train a diffusion denoiser on the target domain (1.5T) so the model learns the clean 1.5T distribution.
+  - Use structure constraints to preserve content from the source domain (0.35T) even though the data is *unpaired*.
 
-## 3. 训练
+  ## Model
 
-```bash
-python src/train.py --data-035t data/0_35T --data-15t data/1_5T --output-dir outputs
-```
+  **Backbone**: Wavelet-Diffusion U-Net ([model.py](file:///f:/Diffusion_Test/src/model.py))
 
-可选参数含义：
+  - U-Net with wavelet down/up sampling (DWT/IDWT) to reduce aliasing and keep detail during multi-scale processing.
+  - Self-attention blocks at intermediate resolutions.
+  - Input is concatenated as `[x_t, cond]` where `cond` is the 0.35T image and `x_t` is the noisy latent at diffusion step `t`.
 
-- --data-035t：0.35T 条件图像目录
-- --data-15t：1.5T 目标图像目录
-- --output-dir：训练输出目录
-- --batch-size：训练 batch 大小
-- --num-epochs：训练 epoch 数
-- --learning-rate：学习率
-- --weight-decay：权重衰减
-- --num-workers：数据加载线程数
-- --image-size：输入图像边长
-- --timesteps：扩散总步数
-- --save-every：模型保存间隔 epoch
-- --keep-checkpoints：最多保留的模型数量
-- --lambda-nce：结构一致性损失权重
-- --lambda-wave：小波低频约束权重
-- --patch-nce-patches：PatchNCE 采样 patch 数
-- --seed：随机种子
+  **Diffusion schedule**: Linear beta schedule ([diffusion.py](file:///f:/Diffusion_Test/src/diffusion.py))
 
-## 4. 测试/增强
+  - Training optimizes the standard noise-prediction objective (`eps` prediction).
+  - Inference uses DDIM sampling only.
 
-```bash
-python src/test.py --input-dir data/0_35T --checkpoint-path outputs/checkpoints/latest.pt --output-dir outputs/inference
-```
+  ## Losses (Training Objective)
 
-输出结果为拼接对比图，左侧为原图，右侧为增强图，保存为 PNG/JPG。
+  The training loss is a weighted sum ([train.py](file:///f:/Diffusion_Test/src/train.py), [losses.py](file:///f:/Diffusion_Test/src/losses.py)):
 
-可选参数含义：
+  - **Diffusion loss**: MSE between predicted noise and true noise on 1.5T samples.
+  - **PatchNCE loss**: Contrastive feature matching between generated output and the 0.35T condition to keep structure.
+  - **Wavelet LL loss**: L1 distance between low-frequency (LL) wavelet components of output and condition.
 
-- --input-dir：待增强 0.35T 图像目录
-- --output-dir：输出目录
-- --checkpoint-path：模型权重路径
-- --timesteps：扩散总步数
-- --start-step：SDEdit 起始步
-- --manifold-alpha：低频流形约束系数
-- --output-ext：输出图片格式（png 或 jpg）
-- --batch-size：推理 batch 大小
-- --num-workers：数据加载线程数
-- --image-size：输入图像边长
+  During training, the script prints epoch averages for:
+  `total / diff / nce / wave` plus the current learning rate.
 
-## 5. 模型导出
+  ## Setup
 
-```bash
-python src/export.py --checkpoint-path outputs/checkpoints/latest.pt --output-path outputs/exported_model.pt
-```
+  Install dependencies:
 
-可选参数含义：
+  ```bash
+  pip install -r requirements.txt
+  ```
 
-- --checkpoint-path：模型权重路径
-- --output-path：导出模型保存路径
-- --image-size：输入图像边长
+  ## Data
 
-## 6. 说明
+  Place data under:
 
-- 训练使用非配对数据，通过 PatchNCE 与小波低频约束增强结构一致性。
-- 训练中每个 epoch 输出耗时、ETA 与系统时间，并按配置保存模型，仅保留最近 10 个模型。
-- 推理采用 SDEdit 风格起始步与小波低频流形约束。
+  - `data/0_35T` for conditional inputs (0.35T)
+  - `data/1_5T` for target domain samples (1.5T)
+
+  Supported formats: `.nii`, `.nii.gz`, `.png/.jpg/...`, `.npy`
+
+  Notes:
+
+  - Training uses axial slicing for NIfTI volumes.
+  - Inference processes each file and exports a single comparison canvas image per input file.
+
+  ## Training
+
+  Example:
+
+  ```bash
+  python src/train.py --data-035t data/0_35T --data-15t data/1_5T --output-dir outputs
+  ```
+
+  Random seed per epoch (useful for augmentation randomness):
+
+  ```bash
+  python src/train.py --data-035t data/0_35T --data-15t data/1_5T --output-dir outputs --seed -1
+  ```
+
+  ### Learning rate schedule (Warmup + Cosine Annealing)
+
+  The training loop uses:
+
+  - **Warmup**: linearly increase LR from `0` to `learning_rate` over `warmup_steps`.
+  - **Cosine decay**: decay LR from `learning_rate` down to `min_learning_rate` towards the end of training.
+
+  Relevant arguments:
+
+  - `--learning-rate` (max LR, default is defined in config)
+  - `--min-learning-rate` (default `1e-6`)
+  - `--warmup-steps` (default `1000`)
+
+  Example:
+
+  ```bash
+  python src/train.py --learning-rate 5e-5 --min-learning-rate 1e-6 --warmup-steps 1000
+  ```
+
+  ## Inference / Enhancement
+
+  Inference uses **DDIM only** ([test.py](file:///f:/Diffusion_Test/src/test.py)).
+
+  Example:
+
+  ```bash
+  python src/test.py \
+    --input-dir data/0_35T \
+    --checkpoint-path outputs/checkpoints/latest.pt \
+    --output-dir outputs/inference \
+    --pred-type eps \
+    --init-mode sdedit \
+    --ddim-steps 200 \
+    --start-step 200
+  ```
+
+  Key arguments:
+
+  - `--timesteps`: diffusion timesteps (must match training)
+  - `--start-step`: SDEdit starting step (lower = less noise; higher = stronger enhancement but harder)
+  - `--ddim-steps`: number of DDIM reverse steps
+  - `--ddim-eta`: noise level for DDIM (0 = deterministic)
+  - `--pred-type`: model output type (`eps` recommended; training is noise-prediction)
+  - `--init-mode`: `sdedit` (noise the input then denoise) or `noise` (start from pure noise)
+  - `--manifold-alpha`: LL wavelet manifold constraint strength during sampling
+
+  Output:
+
+  - A single canvas image per input file showing the input on the left and the final output on the right, with intermediate snapshots in between.
+
+  ## Current Known Issues / Work in Progress
+
+  - **Noisy outputs at high `start-step`**: when `start-step` is large, the model may produce outputs where anatomy is visible but residual noise remains. This is typically addressed by longer training, better LR scheduling, and tuning `lambda_nce / lambda_wave`.
+  - **Hyperparameter sensitivity**: the balance between diffusion loss and structure constraints can lead to “structure preserved but denoising weak” if auxiliary losses dominate.
+  - **Timesteps vs. sampling steps tradeoff**: using large training timesteps but too few DDIM reverse steps can leave residual noise.
+
+  

@@ -29,12 +29,34 @@ def load_arrays(path: str) -> Iterable[np.ndarray]:
         data = nib.load(path).get_fdata().astype(np.float32)
         if data.ndim == 2:
             return [data]
+        if data.ndim == 4:
+            data = data[..., 0]
         if data.ndim == 3:
             return [data[:, :, i] for i in range(data.shape[2])]
         return [np.squeeze(data)]
     img = Image.open(path).convert("L")
     arr = np.array(img, dtype=np.float32)
     return [arr]
+
+
+def load_single_array(path: str) -> np.ndarray:
+    lower = path.lower()
+    if lower.endswith(".npy"):
+        arr = np.load(path).astype(np.float32)
+        if arr.ndim >= 3:
+            return arr[..., arr.shape[-1] // 2]
+        return arr
+    if lower.endswith(".nii") or lower.endswith(".nii.gz"):
+        data = nib.load(path).get_fdata().astype(np.float32)
+        if data.ndim == 2:
+            return data
+        if data.ndim == 4:
+            data = data[..., 0]
+        if data.ndim == 3:
+            return data[:, :, data.shape[2] // 2]
+        return np.squeeze(data)
+    img = Image.open(path).convert("L")
+    return np.array(img, dtype=np.float32)
 
 
 def normalize_array(arr: np.ndarray) -> np.ndarray:
@@ -58,16 +80,22 @@ def augment_tensor(x: torch.Tensor) -> torch.Tensor:
 
 
 class InMemoryDataset(Dataset):
-    def __init__(self, root: str, image_size: int, augment: bool) -> None:
+    def __init__(self, root: str, image_size: int, augment: bool, per_file: bool = False) -> None:
         self.paths = list_files(root)
         self.image_size = image_size
         self.augment = augment
         self.cache = []
         for path in self.paths:
-            for arr in load_arrays(path):
+            if per_file:
+                arr = load_single_array(path)
                 arr = normalize_array(arr)
                 tensor = to_tensor(arr)
                 self.cache.append(tensor)
+            else:
+                for arr in load_arrays(path):
+                    arr = normalize_array(arr)
+                    tensor = to_tensor(arr)
+                    self.cache.append(tensor)
 
     def __len__(self) -> int:
         return len(self.cache)

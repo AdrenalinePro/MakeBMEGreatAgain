@@ -1,5 +1,6 @@
 from typing import List, Tuple
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,11 +11,16 @@ class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.dim = dim
+        half = dim // 2
+        if half <= 0:
+            inv_freq = torch.empty(0)
+        else:
+            denom = max(half - 1, 1)
+            inv_freq = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32) / denom)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        half = self.dim // 2
-        emb = torch.exp(torch.arange(half, device=t.device) * -(torch.log(torch.tensor(10000.0)) / (half - 1)))
-        emb = t.float().unsqueeze(1) * emb.unsqueeze(0)
+        emb = t.float().unsqueeze(1) * self.inv_freq.unsqueeze(0)
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
         if self.dim % 2 == 1:
             emb = F.pad(emb, (0, 1))
@@ -214,23 +220,37 @@ class WaveletUNet(nn.Module):
         h = self.mid_sa(h)
         h = self.mid_rb3(h, t_embed)
         h = self.up4_idwt(h)
+        h, s4 = self._match_size(h, s4)
         h = torch.cat([h, s4], dim=1)
         h = self.up4_rb1(h, t_embed)
         h = self.up4_rb2(h, t_embed)
         h = self.up4_sa(h)
         h = self.up3_idwt(h)
+        h, s3 = self._match_size(h, s3)
         h = torch.cat([h, s3], dim=1)
         h = self.up3_rb1(h, t_embed)
         h = self.up3_rb2(h, t_embed)
         h = self.up3_sa(h)
         h = self.up2_idwt(h)
+        h, s2 = self._match_size(h, s2)
         h = torch.cat([h, s2], dim=1)
         h = self.up2_rb1(h, t_embed)
         h = self.up2_rb2(h, t_embed)
-        h = self.up2_sa(h)
+        if h.shape[-2] * h.shape[-1] <= 88 * 88:
+            h = self.up2_sa(h)
         h = self.up1_idwt(h)
+        h, s1 = self._match_size(h, s1)
         h = torch.cat([h, s1], dim=1)
         h = self.up1_rb1(h, t_embed)
         h = self.up1_rb2(h, t_embed)
         h = self.out_conv(self.out_act(self.out_norm(h)))
+        if h.shape[-2:] != x.shape[-2:]:
+            h = F.interpolate(h, size=x.shape[-2:], mode="bilinear", align_corners=False)
         return h
+
+    @staticmethod
+    def _match_size(a: torch.Tensor, b: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if a.shape[-2:] == b.shape[-2:]:
+            return a, b
+        b = F.interpolate(b, size=a.shape[-2:], mode="bilinear", align_corners=False)
+        return a, b

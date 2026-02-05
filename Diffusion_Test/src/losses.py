@@ -8,8 +8,12 @@ from pytorch_wavelets import DWTForward
 class WaveletLLLoss:
     def __init__(self, wave: str = "bior1.3", mode: str = "symmetric") -> None:
         self.dwt = DWTForward(J=1, wave=wave, mode=mode)
+        self._device = None
 
     def __call__(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        if self._device != x.device:
+            self.dwt = self.dwt.to(x.device)
+            self._device = x.device
         ll_x, _ = self.dwt(x)
         ll_y, _ = self.dwt(y)
         return F.l1_loss(ll_x, ll_y)

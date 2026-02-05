@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 import time
+import math
 
 import torch
 from torch.utils.data import DataLoader
@@ -23,6 +24,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--batch-size", type=int, default=TrainConfig.batch_size)
     parser.add_argument("--num-epochs", type=int, default=TrainConfig.num_epochs)
     parser.add_argument("--learning-rate", type=float, default=TrainConfig.learning_rate)
+    parser.add_argument("--min-learning-rate", type=float, default=TrainConfig.min_learning_rate)
+    parser.add_argument("--warmup-steps", type=int, default=TrainConfig.warmup_steps)
     parser.add_argument("--weight-decay", type=float, default=TrainConfig.weight_decay)
     parser.add_argument("--num-workers", type=int, default=TrainConfig.num_workers)
     parser.add_argument("--image-size", type=int, default=TrainConfig.image_size)
@@ -41,6 +44,8 @@ def parse_args() -> TrainConfig:
         batch_size=args.batch_size,
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
+        min_learning_rate=args.min_learning_rate,
+        warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         num_workers=args.num_workers,
         image_size=args.image_size,
@@ -80,25 +85,48 @@ def save_checkpoint(output_dir: str, epoch: int, model: WaveletUNet, optimizer: 
 
 def train() -> None:
     cfg = parse_args()
-    if cfg.seed < 0:
-        cfg.seed = random.SystemRandom().randint(0, 2**31 - 1)
-    set_seed(cfg.seed)
+    random_seed_mode = cfg.seed < 0
+    if random_seed_mode:
+        set_seed(random.SystemRandom().randint(0, 2**31 - 1))
+    else:
+        set_seed(cfg.seed)
     device = get_device()
     dataset = UnpairedDataset(cfg.data_15t, cfg.data_035t, cfg.image_size, augment=True)
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, drop_last=True)
     model = WaveletUNet().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    total_steps = cfg.num_epochs * max(len(loader), 1)
+    warmup_steps = max(min(int(cfg.warmup_steps), total_steps), 0)
+    max_lr = float(cfg.learning_rate)
+    min_lr = float(cfg.min_learning_rate)
+
+    def lr_at_step(step: int) -> float:
+        if total_steps <= 0 or max_lr <= 0.0:
+            return max_lr
+        if warmup_steps > 0 and step < warmup_steps:
+            return max_lr * (float(step) / float(warmup_steps))
+        decay_steps = max(total_steps - warmup_steps - 1, 1)
+        progress = float(step - warmup_steps) / float(decay_steps)
+        progress = max(0.0, min(1.0, progress))
+        return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
+
+    global_step = 0
     schedule = DiffusionSchedule(cfg.timesteps, device)
     wavelet_loss = WaveletLLLoss()
     ensure_dir(cfg.output_dir)
     epoch_times = []
     for epoch in range(1, cfg.num_epochs + 1):
-        if cfg.seed < 0:
-            cfg.seed = random.SystemRandom().randint(0, 2**31 - 1)
-        set_seed(cfg.seed)
+        if random_seed_mode:
+            set_seed(random.SystemRandom().randint(0, 2**31 - 1))
+        else:
+            set_seed(cfg.seed)
         model.train()
         start_time = time.time()
-        losses = []
+        loss_total_sum = 0.0
+        loss_diff_sum = 0.0
+        loss_nce_sum = 0.0
+        loss_wave_sum = 0.0
+        num_steps = 0
         for x15t, c035t in tqdm(loader, desc=f"epoch {epoch}/{cfg.num_epochs}"):
             x15t = x15t.to(device)
             c035t = c035t.to(device)
@@ -108,21 +136,38 @@ def train() -> None:
             pred_eps = model(xt, t, c035t)
             loss_diff = schedule.loss_diff(pred_eps, noise)
             x0_pred = schedule.predict_x0(xt, t, pred_eps)
-            features_pred = model.encode_features(x0_pred, t)
-            features_c = model.encode_features(c035t, t)
+            t_feat = torch.zeros_like(t)
+            features_pred = model.encode_features(x0_pred, t_feat)
+            features_c = model.encode_features(c035t, t_feat)
             loss_nce = patch_nce_loss(features_pred[1:], features_c[1:], cfg.patch_nce_patches)
             loss_wave = wavelet_loss(x0_pred, c035t)
             total = loss_diff + cfg.lambda_nce * loss_nce + cfg.lambda_wave * loss_wave
+            lr = lr_at_step(global_step)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
             optimizer.zero_grad()
             total.backward()
             optimizer.step()
-            losses.append(total.item())
+            global_step += 1
+            loss_total_sum += float(total.detach().item())
+            loss_diff_sum += float(loss_diff.detach().item())
+            loss_nce_sum += float(loss_nce.detach().item())
+            loss_wave_sum += float(loss_wave.detach().item())
+            num_steps += 1
         epoch_time = time.time() - start_time
         epoch_times.append(epoch_time)
         avg_epoch = sum(epoch_times) / len(epoch_times)
         eta = avg_epoch * (cfg.num_epochs - epoch)
+        denom = max(num_steps, 1)
+        loss_total_avg = loss_total_sum / denom
+        loss_diff_avg = loss_diff_sum / denom
+        loss_nce_avg = loss_nce_sum / denom
+        loss_wave_avg = loss_wave_sum / denom
+        lr = float(optimizer.param_groups[0]["lr"])
         print(
-            f"epoch {epoch} loss {sum(losses)/len(losses):.4f} time {epoch_time:.1f}s eta {eta:.1f}s now {current_time_str()}"
+            f"epoch {epoch} total {loss_total_avg:.4f} diff {loss_diff_avg:.4f} "
+            f"nce {loss_nce_avg:.4f} wave {loss_wave_avg:.4f} "
+            f"lr {lr:.2e} time {epoch_time:.1f}s eta {eta:.1f}s now {current_time_str()}"
         )
         if epoch % cfg.save_every == 0 or epoch == cfg.num_epochs:
             checkpoint_dir = save_checkpoint(cfg.output_dir, epoch, model, optimizer)
